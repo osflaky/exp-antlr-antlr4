@@ -1,0 +1,187 @@
+name: antlr4
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: windows-2022
+          target: tool
+          expander_leg: windows-2022--x64
+    steps:
+      # Check out the code before setting the environment since some
+      # of the actions actually parse the files to figure out the
+      # dependencies, for instance, the setup-java actually parses
+      # **/pom.xml files to decide what to cache.
+    - name: Check out code
+      uses: actions/checkout@v3
+
+    - name: Checkout antlr PHP runtime
+      if: matrix.target == 'php'
+      uses: actions/checkout@v3
+      with:
+        repository: antlr/antlr-php-runtime
+        path: runtime/PHP
+
+    - name: Setup PHP 8.2
+      if: matrix.target == 'php'
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+        extensions: mbstring
+        tools: composer
+
+    - name: Install dependencies
+      env:
+        COMPOSER_CACHE_DIR: ${{ github.workspace }}/.cache
+      if: matrix.target == 'php'
+      run: |-
+        cd runtime/PHP
+        composer install --no-progress --no-interaction --prefer-dist --optimize-autoloader
+
+    - name: Install dependencies (Ubuntu)
+      if: startswith(matrix.os, 'ubuntu')
+      run: |
+        sudo apt-get update -qq
+        sudo apt install -y ninja-build
+
+    - name: Install dependencies (MacOS)
+      if: startswith(matrix.os, 'macos')
+      run: brew install ninja
+
+    - name: Set up JDK 11
+      id: setup-java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'zulu'
+        java-version: 11
+        cache: 'maven'
+
+    - name: Set up Maven
+      if: steps.setup-java.outputs.cache-hit != 'true'
+      uses: stCarolas/setup-maven@v4.5
+      with:
+        maven-version: 3.8.5
+
+    - name: Add msbuild to PATH
+      if: startswith(matrix.os, 'windows') && (matrix.target == 'cpp')
+      uses: microsoft/setup-msbuild@v1.1
+
+    - name: Set up Python 3
+      if: matrix.target == 'python3'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+        architecture: 'x64'
+
+    - name: Set up Node 16
+      if: (matrix.target == 'javascript') || (matrix.target == 'typescript')
+      uses: actions/setup-node@v3.6.0
+      with:
+        node-version: '16'
+
+    - name: Setup Dotnet
+      if: matrix.target == 'csharp'
+      uses: actions/setup-dotnet@v3.0.3
+      with:
+        dotnet-version: '7.0.x'
+
+    - name: Setup Dart 2.12.1
+      if: matrix.target == 'dart'
+      uses: dart-lang/setup-dart@v1.3
+      with:
+        sdk: 2.12.1
+
+    - name: Setup Go 1.19
+      if: matrix.target == 'go'
+      uses: actions/setup-go@v3.3.1
+      with:
+        go-version: '^1.19'
+
+    - name: Setup Swift
+      if: matrix.target == 'swift'
+      uses: swift-actions/setup-swift@v1.19.0
+      with:
+        swift-version: '5.2'
+
+    - name: Use ccache
+      if: (startswith(matrix.os, 'macos') || startswith(matrix.os, 'ubuntu')) &&
+        (matrix.target == 'cpp')
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ matrix.os }}-${{ matrix.target }}
+
+    - name: Configure shell (Ubuntu)
+      if: startswith(matrix.os, 'ubuntu') && (matrix.target == 'cpp')
+      run: echo 'PATH=/usr/lib/ccache:'"$PATH" >> $GITHUB_ENV
+
+    - name: Configure shell (MacOS)
+      if: startswith(matrix.os, 'macos') && (matrix.target == 'cpp')
+      run: echo "PATH=$(brew --prefix)/opt/ccache/libexec:$PATH" >> $GITHUB_ENV
+
+    - name: Build ANTLR with Maven
+      run: mvn install -DskipTests=true -Darguments="-Dmaven.javadoc.skip=true" 
+        -B -V
+
+    - name: Test tool
+      if: matrix.target == 'tool'
+      run: |
+        cd tool-testsuite
+        mvn test
+
+    - name: Test runtime (Windows)
+      if: startsWith(matrix.os, 'windows') && (matrix.target != 'tool')
+      run: |
+        gci env:* | sort-object name
+
+        cd runtime-testsuite
+        switch ("${{ matrix.target }}")
+        {
+          python3 { mvn -X '-Dantlr-python3-exec="${{ env.pythonLocation }}\python.exe"' '-Dtest=python3.**' test }
+          default { mvn -X '-Dtest=${{ matrix.target }}.**' test }
+        }
+
+      env:
+        CMAKE_GENERATOR: Ninja
+
+    - name: Test runtime (non-Windows)
+      if: (startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos'))  
+        && (matrix.target != 'tool')
+      run: |
+        env
+
+        cd runtime-testsuite
+        case ${{ matrix.target }} in
+          python3) mvn -X '-Dantlr-python3-exec=${{ env.pythonLocation }}/bin/python' '-Dtest=python3.**' test ;;
+          *) mvn -X '-Dtest=${{ matrix.target }}.**' test ;;
+        esac
+
+    - name: Prepare artifacts
+      if: always()
+      run: |
+        cd ${{ github.workspace }}/..
+        tar czfp antlr_${{ matrix.os }}_${{ matrix.target }}.tgz --exclude='.git' antlr4
+        mv antlr_${{ matrix.os }}_${{ matrix.target }}.tgz ${{ github.workspace }}/.
+
+    - name: Archive artifacts
+      if: always()
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: antlr_${{ matrix.os }}_${{ matrix.target }}
+        path: antlr_${{ matrix.os }}_${{ matrix.target }}.tgz
+    name: build [${{ matrix.expander_leg }}]
+    timeout-minutes: 150
